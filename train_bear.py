@@ -1,0 +1,350 @@
+import os
+import warnings
+
+import ast
+import copy
+import functools
+import json
+from typing import List, Optional
+
+import fire
+import pandas as pd
+import torch
+import torch.nn.functional as F
+import transformers
+from accelerate import Accelerator
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import Dataset
+from tqdm import tqdm
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    DataCollatorForSeq2Seq,
+)
+from Trie import Trie
+from utils import get_prompt
+
+
+def generate_list_from_csv(train_data_path, id2title_dict, instuction_str, input_prefix_str):
+    def parse_item_ids(item_ids_list):
+        titles = [id2title_dict[item_id] for item_id in item_ids_list if item_id in id2title_dict]
+        return titles
+
+    df = pd.read_csv(train_data_path)
+
+    df["item_ids"] = df["item_ids"].apply(ast.literal_eval)
+    df["user_id"] = df["user_id"].astype(int)
+
+    json_data = []
+    for _, row in df.iterrows():
+        item_ids_list = row["item_ids"]
+        titles = parse_item_ids(item_ids_list)
+
+        input_titles = titles[:-1]
+        output_title = titles[-1]
+
+        input_str = input_prefix_str + ", ".join(f'"{title}"' for title in input_titles)
+        output_str = f'"{output_title}"'
+
+        json_entry = {"instruction": instuction_str, "input": f"{input_str}\n ", "output": output_str}
+        json_data.append(json_entry)
+
+    return json_data
+
+
+class CustomTrainer(transformers.Trainer):
+    def __init__(self, *args, tau: float = 1.0, topk_tau: float = 1.0, topk_weight: float = 1.0, K: int = 10, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.tau = tau  # temperature in SL loss
+        self.topk_tau = topk_tau  # temperature in Top-K loss
+        self.topk_weight = topk_weight  # weight for Top-K loss
+        self.K = K  # Top-K
+
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        self.model.save_pretrained(output_dir, save_embedding_layers=False)
+        torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+
+        constrain_mask = inputs.pop("constrain_mask")
+
+        labels = inputs["labels"]
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        logits = logits[:, -constrain_mask.size(1) - 1 :, :]
+        labels = labels[:, -constrain_mask.size(1) - 1 :]
+        logits = logits[..., :-1, :].contiguous()       # (B, T, V)
+        constrain_mask = constrain_mask.contiguous()    # (B, T, V)
+        labels = labels[..., 1:].contiguous()           # (B, T)
+        logits[~constrain_mask] = -float("inf")
+
+        mask = labels != -100                           # (B, T)
+        vocab_size = logits.size(-1)
+        logits = logits.view(-1, vocab_size)                    # (B * T, V)
+        constrain_mask = constrain_mask.view(-1, vocab_size)    # (B * T, V)
+        labels = labels.view(-1).to(logits.device)              # (B * T, )
+        mask = mask.view(-1)                                    # (B * T, )
+        logits = logits[mask]                                   # (num_tokens, V)
+        constrain_mask = constrain_mask[mask]                   # (num_tokens, V)
+        labels = labels[mask]                                   # (num_tokens, )
+
+        # cross entropy loss with Top-K reweighting
+        probs = F.softmax(logits / self.tau, dim=-1)                    # (num_tokens, V)
+        pos_probs = probs.gather(1, labels.unsqueeze(1)).squeeze(1)     # (num_tokens, )
+        ce_loss = -pos_probs.log()                                      # (num_tokens, )
+        quantile = probs.topk(self.K, dim=-1).values[:, -1].detach()    # (num_tokens, )
+        # replace zero quantile with the minimum non-zero probability
+        min_probs, _ = probs.masked_fill(~constrain_mask, float("inf")).min(dim=-1) # (num_tokens, )
+        quantile = torch.where(quantile == 0, min_probs, quantile).detach()     # (num_tokens, )
+        weights = torch.sigmoid((pos_probs.log() - quantile.log()) / self.topk_tau) # (num_tokens, )
+        weights = weights.detach() * self.topk_weight + 1               # (num_tokens, )
+        # weights should be normalized to 1 (for those with non-zero loss)
+        loss_mask = constrain_mask.sum(dim=-1) > 1                      # (num_tokens, )
+        weights[loss_mask] = weights[loss_mask] / (weights[loss_mask].sum() + 1e-8)  # (num_tokens, )
+        loss = (ce_loss * weights).sum()
+                
+        return (loss, outputs) if return_outputs else loss
+
+
+class CustomDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
+    def __call__(self, features):
+        features_copy = copy.deepcopy(features)
+
+        constrain_mask_values = [feature["constrain_mask"] for feature in features_copy]
+        for feature in features_copy:
+            feature.pop("constrain_mask")
+        batch = super().__call__(features_copy)
+        batch["constrain_mask"] = pad_sequence(
+            constrain_mask_values, batch_first=True, padding_value=1, padding_side="left"
+        )
+
+        return batch
+
+
+class Prompt_dataset(Dataset):
+    def __init__(self, datalist):
+        self.datalist = datalist
+
+    def __len__(self):
+        return len(self.datalist)
+
+    def __getitem__(self, idx):
+        return self.datalist[idx]
+
+
+def train(
+    dataset_name: str,
+    base_model: str = "/path/to/your/LLM/Llama-3.2-3B",
+    sample: int = -1,
+    seed: int = 42,
+    # training hyperparams
+    batch_size: int = 128,
+    num_epochs: int = 10,
+    learning_rate: float = 1e-4,
+    # lora hyperparams
+    lora_r: int = 8,
+    lora_alpha: int = 16,
+    lora_dropout: float = 0.05,
+    lora_target_modules: List[str] = [
+        "q_proj",
+        "v_proj",
+    ],
+    train_on_inputs: int = 0,
+    # loss hyperparams
+    tau: float = 1.0,
+    topk_tau: float = 1.0,
+    topk_weight: float = 1.0,
+):
+    params = locals()
+    transformers.set_seed(seed)
+    accelerator = Accelerator()
+
+    instruction_prompt, history_prompt = get_prompt(dataset_name)
+
+    id2title_path = os.path.join("./data/", dataset_name, "id2name4Rec.json")
+    with open(id2title_path, "r") as file:
+        data = json.load(file)
+    id2title_dict = {int(k): v for k, v in data.items()}
+
+    train_data_path = os.path.join("./data/", dataset_name, f"train_{sample}.csv")
+    train_data = generate_list_from_csv(
+        train_data_path=train_data_path,
+        id2title_dict=id2title_dict,
+        instuction_str=instruction_prompt,
+        input_prefix_str=history_prompt,
+    )
+
+    model_name = base_model.split("/")[-1]
+    father_path = os.path.join(
+        "./save_lora_model",
+        model_name,
+        dataset_name,
+        f"sample{sample}_epoch{num_epochs}_bear_tau{tau}_topktau{topk_tau}_topkw{topk_weight}",
+    )
+    i = 0
+    output_dir = os.path.join(father_path, str(i))
+    while os.path.exists(output_dir):
+        i += 1
+        output_dir = os.path.join(father_path, str(i))
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "params.json"), "w") as f:
+            json.dump(params, f, indent=4)
+
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    micro_batch_size = batch_size // world_size
+    gradient_accumulation_steps = batch_size // micro_batch_size // world_size
+
+    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        quantization_config=bnb_config,
+        torch_dtype=torch.bfloat16,
+        device_map={"": int(os.environ.get("LOCAL_RANK") or 0)},
+    )
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    tokenizer.add_special_tokens({"pad_token": "<pad>"})
+    model.resize_token_embeddings(len(tokenizer))
+    model.config.pad_token_id = tokenizer.pad_token_id
+    tokenizer.padding_side = "left"
+
+    model = prepare_model_for_kbit_training(model)
+    config = LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        target_modules=lora_target_modules,
+        lora_dropout=lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, config)
+
+    sep = tokenizer.encode("### Response:\n", add_special_tokens=False)  # [14711, 6075, 512]
+    titles_list = list(id2title_dict.values())
+    tokens_list = [
+        tokenizer.encode(f'"{title}"', add_special_tokens=False)
+        + [tokenizer.eos_token_id]
+        for title in titles_list
+    ]
+    trie = Trie()
+    for tokens in tokens_list:
+        trie.insert(tokens)
+    vocab_size = len(tokenizer)
+
+    def tokenize(prompt, add_eos_token=True):
+        result = tokenizer(prompt, padding=False, return_tensors=None)
+        if result["input_ids"][-1] != tokenizer.eos_token_id and add_eos_token:
+            result["input_ids"].append(tokenizer.eos_token_id)
+            result["attention_mask"].append(1)
+
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    def generate_and_tokenize_prompt(data_point):
+        full_prompt = generate_prompt(data_point)
+        tokenized_full_prompt = tokenize(full_prompt)
+
+        if not train_on_inputs:
+            # instruction + input, no output
+            user_prompt = generate_prompt({**data_point, "output": ""})
+            tokenized_user_prompt = tokenize(user_prompt, add_eos_token=False)
+            user_prompt_len = len(tokenized_user_prompt["input_ids"])
+            # only the ouput part (one item title) is used for training
+            tokenized_full_prompt["labels"] = [-100] * user_prompt_len + tokenized_full_prompt["labels"][user_prompt_len:]
+            # CBS is also applied to the output part
+            input_ids = tokenized_full_prompt["input_ids"]
+            constrain_mask = torch.ones(len(input_ids) - user_prompt_len, vocab_size, dtype=torch.bool)
+            # find the trie path and all valid tokens of the output item
+            response_idx_end = None
+            for i in range(len(input_ids) - len(sep), -1, -1):
+                if input_ids[i : i + len(sep)] == sep:
+                    response_idx_end = i + len(sep)
+                    break
+            if response_idx_end is None:
+                print("Response not found in input_ids")
+                return None
+            title_tokens = input_ids[response_idx_end:]
+            allowed_tokens_list = trie.valid_tokens(title_tokens)[:-1]
+            assert constrain_mask.shape[0] == len(allowed_tokens_list)
+            # only the valid tokens are set constrain_mask to True
+            for i, allowed_tokens in enumerate(allowed_tokens_list):
+                mask = torch.zeros(vocab_size, dtype=torch.bool)
+                mask[allowed_tokens] = True
+                constrain_mask[i] = mask
+            tokenized_full_prompt["constrain_mask"] = constrain_mask
+
+        return tokenized_full_prompt
+
+    train_data = [generate_and_tokenize_prompt(sample) for sample in tqdm(train_data) if sample is not None]
+    train_data = Prompt_dataset(train_data)
+
+    trainer = CustomTrainer(
+        model=model,
+        train_dataset=train_data,
+        data_collator=CustomDataCollatorForSeq2Seq(tokenizer, pad_to_multiple_of=8),
+        tau=tau,
+        topk_tau=topk_tau,
+        topk_weight=topk_weight,
+        args=transformers.TrainingArguments(
+            output_dir=output_dir,
+            per_device_train_batch_size=micro_batch_size,
+            per_device_eval_batch_size=micro_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            warmup_steps=20,
+            num_train_epochs=num_epochs,
+            learning_rate=learning_rate,
+            bf16=True,
+            tf32=True,
+            optim="adamw_torch",
+            logging_strategy="steps",
+            logging_steps=0.1,
+            save_strategy="epoch",
+            gradient_checkpointing=False,
+            save_on_each_node=False,
+            log_on_each_node=False,
+            ddp_find_unused_parameters=False if (world_size != 1) else None,
+            report_to="tensorboard",
+            local_rank=int(os.environ.get("LOCAL_RANK", -1)),
+            seed=seed,
+            data_seed=seed,
+            remove_unused_columns=False,
+        ),
+    )
+    model.config.use_cache = False
+    trainer.train()
+    model.save_pretrained(output_dir, save_embedding_layers=False)
+
+
+def generate_prompt(data_point):
+    if data_point["input"]:
+        return f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request. 
+
+### Instruction:
+{data_point["instruction"]}
+
+### Input:
+{data_point["input"]}
+
+### Response:
+{data_point["output"]}"""
+    else:
+        return f"""Below is an instruction that describes a task. Write a response that appropriately completes the request.  
+
+### Instruction:
+{data_point["instruction"]}
+
+### Response:
+{data_point["output"]}"""
+
+
+if __name__ == "__main__":
+    fire.Fire(train)
